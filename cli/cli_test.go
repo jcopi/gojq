@@ -12,8 +12,6 @@ import (
 
 func init() {
 	addDefaultModulePaths = false
-	os.Setenv("NO_COLOR", "")
-	os.Setenv("GOJQ_COLORS", "")
 }
 
 func setLocation(loc *time.Location) func() {
@@ -23,6 +21,12 @@ func setLocation(loc *time.Location) func() {
 }
 
 func TestCliRun(t *testing.T) {
+	if err := os.Setenv("NO_COLOR", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Setenv("GOJQ_COLORS", ""); err != nil {
+		t.Fatal(err)
+	}
 	f, err := os.Open("test.yaml")
 	if err != nil {
 		t.Fatal(err)
@@ -64,7 +68,11 @@ func TestCliRun(t *testing.T) {
 			for _, env := range tc.Env {
 				xs := strings.SplitN(env, "=", 2)
 				k, v := xs[0], xs[1]
-				defer func(v string) { os.Setenv(k, v) }(os.Getenv(k))
+				defer func(v string) {
+					if err := os.Setenv(k, v); err != nil {
+						t.Fatal(err)
+					}
+				}(os.Getenv(k))
 				if k == "GOJQ_COLORS" {
 					defer func(colors [][]byte) {
 						nullColor, falseColor, trueColor, numberColor,
@@ -76,7 +84,9 @@ func TestCliRun(t *testing.T) {
 						stringColor, objectKeyColor, arrayColor, objectColor,
 					})
 				}
-				os.Setenv(k, v)
+				if err := os.Setenv(k, v); err != nil {
+					t.Fatal(err)
+				}
 			}
 			code := cli.run(tc.Args)
 			if tc.Error == "" {
@@ -107,8 +117,8 @@ func TestCliRun(t *testing.T) {
 				if diff := cmp.Diff(tc.Expected, outStream.String()); diff != "" {
 					t.Error("standard output:\n" + diff)
 				}
-				if got, expected := errorReplacer.Replace(errStr), strings.TrimSpace(tc.Error); !strings.Contains(got, expected) {
-					t.Error("standard error output:\n" + cmp.Diff(expected, got))
+				if got := errorReplacer.Replace(errStr); !strings.HasPrefix(got, tc.Error) && !strings.HasSuffix(got, tc.Error) {
+					t.Error("standard error output:\n" + cmp.Diff(tc.Error, got))
 				}
 				if !strings.HasSuffix(errStr, "\n") && !strings.Contains(tc.Name, "stderr") && !strings.Contains(tc.Name, "halt_error") {
 					t.Error(`standard error output should end with "\n"`)

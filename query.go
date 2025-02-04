@@ -5,6 +5,20 @@ import (
 	"strings"
 )
 
+// Parse a query string, and returns the query struct.
+//
+// If parsing failed, it returns an error of type [*ParseError], which has
+// the byte offset and the invalid token. The byte offset is the scanned bytes
+// when the error occurred. The token is empty if the error occurred after
+// scanning the entire query string.
+func Parse(src string) (*Query, error) {
+	l := newLexer(src)
+	if yyParse(l) > 0 {
+		return nil, l.err
+	}
+	return l.result, nil
+}
+
 // Query represents the abstract syntax tree of a jq query.
 type Query struct {
 	Meta     *ConstObject
@@ -48,13 +62,8 @@ func (e *Query) writeTo(s *strings.Builder) {
 	for _, im := range e.Imports {
 		im.writeTo(s)
 	}
-	for i, fd := range e.FuncDefs {
-		if i > 0 {
-			s.WriteByte(' ')
-		}
+	for _, fd := range e.FuncDefs {
 		fd.writeTo(s)
-	}
-	if len(e.FuncDefs) > 0 {
 		s.WriteByte(' ')
 	}
 	if e.Func != "" {
@@ -659,7 +668,7 @@ type ObjectKeyVal struct {
 	Key       string
 	KeyString *String
 	KeyQuery  *Query
-	Val       *ObjectVal
+	Val       *Query
 }
 
 func (e *ObjectKeyVal) String() string {
@@ -692,32 +701,6 @@ func (e *ObjectKeyVal) minify() {
 	}
 	if e.Val != nil {
 		e.Val.minify()
-	}
-}
-
-// ObjectVal ...
-type ObjectVal struct {
-	Queries []*Query
-}
-
-func (e *ObjectVal) String() string {
-	var s strings.Builder
-	e.writeTo(&s)
-	return s.String()
-}
-
-func (e *ObjectVal) writeTo(s *strings.Builder) {
-	for i, e := range e.Queries {
-		if i > 0 {
-			s.WriteString(" | ")
-		}
-		e.writeTo(s)
-	}
-}
-
-func (e *ObjectVal) minify() {
-	for _, e := range e.Queries {
-		e.minify()
 	}
 }
 
@@ -928,7 +911,7 @@ func (e *Try) minify() {
 
 // Reduce ...
 type Reduce struct {
-	Term    *Term
+	Query   *Query
 	Pattern *Pattern
 	Start   *Query
 	Update  *Query
@@ -942,7 +925,7 @@ func (e *Reduce) String() string {
 
 func (e *Reduce) writeTo(s *strings.Builder) {
 	s.WriteString("reduce ")
-	e.Term.writeTo(s)
+	e.Query.writeTo(s)
 	s.WriteString(" as ")
 	e.Pattern.writeTo(s)
 	s.WriteString(" (")
@@ -953,14 +936,14 @@ func (e *Reduce) writeTo(s *strings.Builder) {
 }
 
 func (e *Reduce) minify() {
-	e.Term.minify()
+	e.Query.minify()
 	e.Start.minify()
 	e.Update.minify()
 }
 
 // Foreach ...
 type Foreach struct {
-	Term    *Term
+	Query   *Query
 	Pattern *Pattern
 	Start   *Query
 	Update  *Query
@@ -975,7 +958,7 @@ func (e *Foreach) String() string {
 
 func (e *Foreach) writeTo(s *strings.Builder) {
 	s.WriteString("foreach ")
-	e.Term.writeTo(s)
+	e.Query.writeTo(s)
 	s.WriteString(" as ")
 	e.Pattern.writeTo(s)
 	s.WriteString(" (")
@@ -990,7 +973,7 @@ func (e *Foreach) writeTo(s *strings.Builder) {
 }
 
 func (e *Foreach) minify() {
-	e.Term.minify()
+	e.Query.minify()
 	e.Start.minify()
 	e.Update.minify()
 	if e.Extract != nil {
@@ -1074,6 +1057,14 @@ func (e *ConstTerm) toValue() any {
 	}
 }
 
+func (e *ConstTerm) toString() (string, bool) {
+	if e.Object != nil || e.Array != nil ||
+		e.Number != "" || e.Null || e.True || e.False {
+		return "", false
+	}
+	return e.Str, true
+}
+
 // ConstObject ...
 type ConstObject struct {
 	KeyVals []*ConstObjectKeyVal
@@ -1133,7 +1124,7 @@ func (e *ConstObjectKeyVal) writeTo(s *strings.Builder) {
 	if e.Key != "" {
 		s.WriteString(e.Key)
 	} else {
-		s.WriteString(e.KeyString)
+		jsonEncodeString(s, e.KeyString)
 	}
 	s.WriteString(": ")
 	e.Val.writeTo(s)

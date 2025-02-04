@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"runtime"
 	"strings"
 
@@ -17,7 +16,7 @@ import (
 
 const name = "gojq"
 
-const version = "0.12.13"
+const version = "0.12.17"
 
 var revision = "HEAD"
 
@@ -59,7 +58,7 @@ type flagopts struct {
 	OutputRaw0    bool              `long:"raw-output0" description:"implies -r with NUL character delimiter"`
 	OutputJoin    bool              `short:"j" long:"join-output" description:"implies -r with no newline delimiter"`
 	OutputCompact bool              `short:"c" long:"compact-output" description:"output without pretty-printing"`
-	OutputIndent  *int              `long:"indent" description:"number of spaces for indentation"`
+	OutputIndent  *int              `long:"indent" args:"number" description:"number of spaces for indentation"`
 	OutputTab     bool              `long:"tab" description:"use tabs for indentation"`
 	OutputYAML    bool              `long:"yaml-output" description:"output in YAML format"`
 	OutputColor   bool              `short:"C" long:"color-output" description:"output with colors even if piped"`
@@ -69,12 +68,12 @@ type flagopts struct {
 	InputStream   bool              `long:"stream" description:"parse input in stream fashion"`
 	InputYAML     bool              `long:"yaml-input" description:"read input as YAML format"`
 	InputSlurp    bool              `short:"s" long:"slurp" description:"read all inputs into an array"`
-	FromFile      string            `short:"f" long:"from-file" description:"load query from file"`
-	ModulePaths   []string          `short:"L" description:"directory to search modules from"`
-	Arg           map[string]string `long:"arg" description:"set a string value to a variable"`
-	ArgJSON       map[string]string `long:"argjson" description:"set a JSON value to a variable"`
-	SlurpFile     map[string]string `long:"slurpfile" description:"set the JSON contents of a file to a variable"`
-	RawFile       map[string]string `long:"rawfile" description:"set the contents of a file to a variable"`
+	FromFile      bool              `short:"f" long:"from-file" description:"load query from file"`
+	ModulePaths   []string          `short:"L" long:"library-path" args:"dir" description:"directory to search modules from"`
+	Arg           map[string]string `long:"arg" args:"name value" description:"set a string value to a variable"`
+	ArgJSON       map[string]string `long:"argjson" args:"name value" description:"set a JSON value to a variable"`
+	SlurpFile     map[string]string `long:"slurpfile" args:"name file" description:"set the JSON contents of a file to a variable"`
+	RawFile       map[string]string `long:"rawfile" args:"name file" description:"set the contents of a file to a variable"`
 	Args          []any             `long:"args" positional:"" description:"consume remaining arguments as positional string values"`
 	JSONArgs      []any             `long:"jsonargs" positional:"" description:"consume remaining arguments as positional JSON values"`
 	ExitStatus    bool              `short:"e" long:"exit-status" description:"exit 1 when the last value is false or null"`
@@ -86,7 +85,9 @@ var addDefaultModulePaths = true
 
 func (cli *cli) run(args []string) int {
 	if err := cli.runInternal(args); err != nil {
-		cli.printError(err)
+		if _, ok := err.(interface{ isEmptyError() }); !ok {
+			fmt.Fprintf(cli.errStream, "%s: %s\n", name, err)
+		}
 		if err, ok := err.(interface{ ExitCode() int }); ok {
 			return err.ExitCode()
 		}
@@ -205,17 +206,19 @@ Usage:
 		"positional": positional,
 	})
 	var arg, fname string
-	if opts.FromFile != "" {
-		src, err := os.ReadFile(opts.FromFile)
+	if opts.FromFile {
+		if len(args) == 0 {
+			return errors.New("expected a query file for flag `-f'")
+		}
+		src, err := os.ReadFile(args[0])
 		if err != nil {
 			return err
 		}
-		arg, fname = string(src), opts.FromFile
+		arg, args, fname = string(src), args[1:], args[0]
 	} else if len(args) == 0 {
 		arg = "."
 	} else {
-		arg, fname = strings.TrimSpace(args[0]), "<arg>"
-		args = args[1:]
+		arg, args, fname = strings.TrimSpace(args[0]), args[1:], "<arg>"
 	}
 	if opts.ExitStatus {
 		cli.exitCodeError = &exitCodeError{exitCodeNoValueErr}
@@ -231,7 +234,7 @@ Usage:
 	}
 	modulePaths := opts.ModulePaths
 	if len(modulePaths) == 0 && addDefaultModulePaths {
-		modulePaths = listDefaultModulePaths()
+		modulePaths = []string{"~/.jq", "$ORIGIN/../lib/gojq", "$ORIGIN/../lib"}
 	}
 	iter := cli.createInputIter(args)
 	defer iter.Close()
@@ -272,23 +275,6 @@ Usage:
 		iter = newNullInputIter()
 	}
 	return cli.process(iter, code)
-}
-
-func listDefaultModulePaths() []string {
-	modulePaths := []string{"", "../lib/gojq", "../lib"}
-	if executable, err := os.Executable(); err == nil {
-		if executable, err := filepath.EvalSymlinks(executable); err == nil {
-			origin := filepath.Dir(executable)
-			modulePaths[1] = filepath.Join(origin, modulePaths[1])
-			modulePaths[2] = filepath.Join(origin, modulePaths[2])
-		}
-	}
-	if homeDir, err := os.UserHomeDir(); err == nil {
-		modulePaths[0] = filepath.Join(homeDir, ".jq")
-	} else {
-		modulePaths = modulePaths[1:]
-	}
-	return modulePaths
 }
 
 func slurpFile(name string) (any, error) {
@@ -339,18 +325,35 @@ func (cli *cli) process(iter inputIter, code *gojq.Code) error {
 	for {
 		v, ok := iter.Next()
 		if !ok {
-			return err
+			break
 		}
-		if er, ok := v.(error); ok {
-			cli.printError(er)
-			err = &emptyError{er}
+		if e, ok := v.(error); ok {
+			fmt.Fprintf(cli.errStream, "%s: %s\n", name, e)
+			err = e
 			continue
 		}
-		if er := cli.printValues(code.Run(v, cli.argvalues...)); er != nil {
-			cli.printError(er)
-			err = &emptyError{er}
+		if e := cli.printValues(code.Run(v, cli.argvalues...)); e != nil {
+			if e, ok := e.(*gojq.HaltError); ok {
+				if v := e.Value(); v != nil {
+					if str, ok := v.(string); ok {
+						cli.errStream.Write([]byte(str))
+					} else {
+						bs, _ := gojq.Marshal(v)
+						cli.errStream.Write(bs)
+						cli.errStream.Write([]byte{'\n'})
+					}
+				}
+				err = e
+				break
+			}
+			fmt.Fprintf(cli.errStream, "%s: %s\n", name, e)
+			err = e
 		}
 	}
+	if err != nil {
+		return &emptyError{err}
+	}
+	return nil
 }
 
 func (cli *cli) printValues(iter gojq.Iter) error {
@@ -425,21 +428,4 @@ func (cli *cli) funcStderr(v any, _ []any) any {
 		return err
 	}
 	return v
-}
-
-func (cli *cli) printError(err error) {
-	if er, ok := err.(interface{ IsEmptyError() bool }); !ok || !er.IsEmptyError() {
-		if er, ok := err.(interface{ IsHaltError() bool }); !ok || !er.IsHaltError() {
-			fmt.Fprintf(cli.errStream, "%s: %s\n", name, err)
-		} else if er, ok := err.(gojq.ValueError); ok {
-			v := er.Value()
-			if str, ok := v.(string); ok {
-				cli.errStream.Write([]byte(str))
-			} else {
-				bs, _ := gojq.Marshal(v)
-				cli.errStream.Write(bs)
-				cli.errStream.Write([]byte{'\n'})
-			}
-		}
-	}
 }
